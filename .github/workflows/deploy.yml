@@ -1,0 +1,50 @@
+name: Deploy to RapidAPI
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  deploy-rapidapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+          
+      - name: Deploy to Railway
+        run: |
+          # Deploy via Railway CLI
+          npm install -g railway
+          railway login --token ${{ secrets.RAILWAY_TOKEN }}
+          railway deploy --service browser-use-api
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: deploy-rapidapi
+    steps:
+      - name: Get API URL
+        run: |
+          echo "API deployed to: ${{ secrets.RAILWAY_SERVICE_URL }}"
+          
+      - name: Notify success
+        if: success()
+        run: |
+          echo "✅ Browser Use API deployed successfully!"
+          echo "📡 Endpoint: ${{ secrets.RAILWAY_SERVICE_URL }}/scrape"
+          
+      - name: Notify failure  
+        if: failure()
+        run: echo "❌ Deployment failed"
