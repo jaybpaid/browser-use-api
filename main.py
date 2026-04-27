@@ -1,13 +1,12 @@
 """
 Browser Use API - AI-Powered Web Scraping
-FastAPI service using browser-use for reliable, AI-guided web scraping.
+Uses Playwright for reliable browser automation.
 """
 import os
 import asyncio
 import json
-from typing import Optional, List
+from typing import List, Optional
 from datetime import datetime
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,34 +15,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Request models
-class ScrapeRequest(BaseModel):
-    url: str = Field(..., description="URL to scrape")
-    task: str = Field(
-        default="Extract all visible content from this page",
-        description="What to extract or do on the page"
-    )
-    model: str = Field(default="gpt-4o-mini", description="Model to use")
-
-class BatchScrapeRequest(BaseModel):
-    urls: List[str] = Field(..., description="List of URLs to scrape")
-    task: str = Field(default="Extract all visible content from each page")
-
-# In-memory storage for async jobs
-jobs = {}
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup/shutdown events."""
-    print("🚀 Browser Use API starting...")
-    yield
-    print("👋 Browser Use API shutting down...")
-
 app = FastAPI(
     title="Browser Use API",
-    description="AI-Powered Web Scraping - Uses browser-use to reliably scrape any website",
+    description="AI-Powered Web Scraping with browser automation",
     version="1.0.0",
-    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -54,12 +29,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Models
+class ScrapeRequest(BaseModel):
+    url: str = Field(..., description="URL to scrape")
+    task: str = Field(
+        default="Extract all visible content from the page",
+        description="What to extract or do"
+    )
+    wait_for: Optional[str] = Field(
+        default=None,
+        description="CSS selector to wait for before returning"
+    )
+
+class BatchRequest(BaseModel):
+    urls: List[str] = Field(..., description="List of URLs to scrape")
+    task: str = Field(default="Extract all content from each page")
+
+# Job storage
+jobs = {}
+
+from playwright.async_api import async_playwright as pw
+
+async def scrape_with_playwright(url: str, task: str = "Extract all content") -> dict:
+    """Scrape a URL using Playwright."""
+    browser = None
+    try:
+        async with pw() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-software-rasterizer',
+                ]
+            )
+            
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )
+            
+            page = await context.new_page()
+            
+            # Navigate and wait
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(1000)  # Wait for JS
+            
+            # Get content
+            content = await page.content()
+            title = await page.title()
+            
+            # Try to extract specific data
+            try:
+                # Get main text content
+                text = await page.inner_text("body")
+            except:
+                text = content
+            
+            await browser.close()
+            
+            return {
+                "success": True,
+                "url": url,
+                "title": title,
+                "content": text[:50000],  # Limit to 50k chars
+                "html": content[:10000],  # First 10k of HTML
+            }
+            
+    except Exception as e:
+        if browser:
+            await browser.close()
+        return {
+            "success": False,
+            "url": url,
+            "error": str(e)
+        }
+
 @app.get("/")
 async def root():
     return {
         "service": "Browser Use API",
         "version": "1.0.0",
-        "description": "AI-Powered Web Scraping using browser-use",
+        "status": "active",
         "docs": "/docs",
     }
 
@@ -69,38 +121,17 @@ async def health():
 
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
-    """Scrape a URL using browser-use AI agent."""
-    job_id = f"scrape_{datetime.now().timestamp()}"
-    jobs[job_id] = {"status": "starting", "url": request.url}
+    """Scrape a URL with Playwright."""
+    result = await scrape_with_playwright(request.url, request.task)
     
-    try:
-        from browser_use_sdk.v3 import AsyncBrowserUse
-        
-        client = AsyncBrowserUse()
-        jobs[job_id]["status"] = "running"
-        
-        result = await client.run(
-            task=f"{request.task}. URL: {request.url}",
-            model=request.model,
-        )
-        
-        jobs[job_id]["status"] = "completed"
-        
-        return {
-            "job_id": job_id,
-            "success": True,
-            "url": request.url,
-            "content": result.output if hasattr(result, 'output') else str(result),
-            "model": request.model,
-        }
-        
-    except Exception as e:
-        jobs[job_id]["status"] = "failed"
-        raise HTTPException(status_code=500, detail=str(e))
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Scraping failed"))
+    
+    return result
 
 @app.post("/scrape/batch")
-async def scrape_batch(request: BatchScrapeRequest, background_tasks: BackgroundTasks):
-    """Submit batch scraping job."""
+async def scrape_batch(request: BatchRequest, background_tasks: BackgroundTasks):
+    """Batch scrape multiple URLs."""
     job_id = f"batch_{datetime.now().timestamp()}"
     jobs[job_id] = {
         "status": "pending",
@@ -109,7 +140,7 @@ async def scrape_batch(request: BatchScrapeRequest, background_tasks: Background
         "results": []
     }
     
-    background_tasks.add_task(run_batch_job, job_id, request)
+    background_tasks.add_task(run_batch, job_id, request.urls, request.task)
     
     return {
         "job_id": job_id,
@@ -117,15 +148,13 @@ async def scrape_batch(request: BatchScrapeRequest, background_tasks: Background
     }
 
 @app.get("/jobs/{job_id}")
-async def get_job_status(job_id: str):
-    """Get status of a scraping job."""
+async def get_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs[job_id]
 
 @app.get("/jobs/{job_id}/results")
 async def get_job_results(job_id: str):
-    """Get results of a completed job."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -135,35 +164,34 @@ async def get_job_results(job_id: str):
     
     return job["results"]
 
-async def run_batch_job(job_id: str, request: BatchScrapeRequest):
+async def run_batch(job_id: str, urls: List[str], task: str):
     """Background batch scraping."""
-    from browser_use_sdk.v3 import AsyncBrowserUse
-    
-    client = AsyncBrowserUse()
     jobs[job_id]["status"] = "running"
-    
     results = []
-    for i, url in enumerate(request.urls):
-        try:
-            result = await client.run(
-                task=f"{request.task}. URL: {url}",
-            )
-            results.append({
-                "url": url,
-                "success": True,
-                "content": result.output if hasattr(result, 'output') else str(result),
-            })
-        except Exception as e:
-            results.append({
-                "url": url,
-                "success": False,
-                "error": str(e),
-            })
-        
-        jobs[job_id]["completed"] = i + 1
+    
+    for url in urls:
+        result = await scrape_with_playwright(url, task)
+        results.append(result)
+        jobs[job_id]["completed"] += 1
     
     jobs[job_id]["status"] = "completed"
     jobs[job_id]["results"] = results
+
+# Apify Actor entry point
+async def main():
+    """Run as Apify Actor."""
+    from apify import Actor
+    
+    actor_input = await Actor.get_input()
+    if not actor_input:
+        raise ValueError("No input provided")
+    
+    url = actor_input.get("url")
+    task = actor_input.get("task", "Extract all content")
+    
+    result = await scrape_with_playwright(url, task)
+    
+    await Actor.push_data(result)
 
 if __name__ == "__main__":
     import uvicorn
